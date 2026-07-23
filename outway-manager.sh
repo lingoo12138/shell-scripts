@@ -659,7 +659,6 @@ stop_ndppd() {
 status_all() {
     echo -e "${BLUE}=== 服务状态总览 ===${NC}"
 
-    # outway 状态
     if [ -f "$SYSTEMD_SERVICE" ]; then
         echo -e "${BLUE}--- outway ---${NC}"
         systemctl is-active --quiet outway && echo -e "状态: ${GREEN}运行中${NC}" || echo -e "状态: ${RED}已停止${NC}"
@@ -669,7 +668,6 @@ status_all() {
         echo -e "${YELLOW}outway 未安装。${NC}\n"
     fi
 
-    # ndppd 状态
     if command -v ndppd &>/dev/null && [ -f /etc/ndppd.conf ]; then
         echo -e "${BLUE}--- ndppd ---${NC}"
         systemctl is-active --quiet ndppd && echo -e "状态: ${GREEN}运行中${NC}" || echo -e "状态: ${RED}已停止${NC}"
@@ -679,13 +677,15 @@ status_all() {
         echo -e "${YELLOW}ndppd 未安装或未配置。${NC}\n"
     fi
 
-    # 显示当前配置文件位置
     echo -e "${BLUE}配置文件: $CONFIG_FILE${NC}"
 }
 
-# ==================== 卸载 ====================
+# ==================== 卸载（彻底清理，包含 ndppd 软件包卸载） ====================
 uninstall_outway() {
     check_root
+    # 确保 PKG_MANAGER 可用
+    detect_os
+
     echo -e "${RED}=== Outway 卸载（彻底清理） ===${NC}"
     if ! load_config; then
         echo -e "${YELLOW}未找到配置文件，将跳过部分清理（但会尝试删除服务、二进制等）。${NC}"
@@ -729,15 +729,41 @@ uninstall_outway() {
         fi
     fi
 
-    if [ "$NDPPD_SET" = "true" ] || confirm_step "${YELLOW}是否停止并卸载 ndppd？${NC}"; then
-        if systemctl is-active --quiet ndppd; then
-            systemctl stop ndppd
-            systemctl disable ndppd
-            echo "ndppd 已停止并禁用。"
+    # ----- 清理 ndppd -----
+    if [ "$NDPPD_SET" = "true" ] || confirm_step "${YELLOW}是否停止并清理 ndppd？${NC}"; then
+        if command -v ndppd &>/dev/null; then
+            if systemctl is-active --quiet ndppd; then
+                systemctl stop ndppd
+                echo "ndppd 已停止。"
+            fi
+            systemctl disable ndppd 2>/dev/null && echo "ndppd 已禁用开机自启。"
         fi
+
         if confirm_step "${YELLOW}是否删除 ndppd 配置文件 (/etc/ndppd.conf)？${NC}"; then
             rm -f /etc/ndppd.conf
             echo "ndppd 配置文件已删除。"
+        fi
+
+        # 询问是否卸载软件包
+        if command -v ndppd &>/dev/null; then
+            if confirm_step "${YELLOW}是否彻底卸载 ndppd 软件包（移除二进制和系统服务文件）？${NC}"; then
+                echo -e "${BLUE}正在卸载 ndppd 软件包...${NC}"
+                case "$PKG_MANAGER" in
+                    apt)
+                        apt remove -y ndppd
+                        ;;
+                    yum)
+                        yum remove -y ndppd
+                        ;;
+                    dnf)
+                        dnf remove -y ndppd
+                        ;;
+                    *)
+                        echo -e "${RED}无法自动卸载，请手动执行卸载命令（如 apt remove ndppd）。${NC}"
+                        ;;
+                esac
+                echo "ndppd 软件包已卸载。"
+            fi
         fi
     fi
 
