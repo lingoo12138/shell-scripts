@@ -302,13 +302,13 @@ configure_sysctl() {
     fi
 }
 
-# ==================== 配置路由（修复：检查 local 表，使用 grep -F）====================
+# ==================== 配置路由（使用物理网卡 dev $INTERFACE）====================
 configure_route() {
-    if confirm_step "${YELLOW}是否添加本地路由 (ip -6 route add local $CIDR dev lo)？${NC}"; then
+    if confirm_step "${YELLOW}是否添加本地路由 (ip -6 route add local $CIDR dev $INTERFACE)？${NC}"; then
         if ip -6 route show table local | grep -q "$CIDR"; then
             echo -e "${GREEN}路由已存在，跳过添加。${NC}"
         else
-            ip -6 route add local "$CIDR" dev lo
+            ip -6 route add local "$CIDR" dev "$INTERFACE"
             echo -e "${GREEN}路由添加成功。${NC}"
         fi
         ROUTE_SET="true"
@@ -316,11 +316,11 @@ configure_route() {
         if confirm_step "${YELLOW}是否将路由持久化？${NC}"; then
             local persist_success=false
             if [ -f /etc/network/interfaces ]; then
-                if grep -Fq "post-up ip -6 route add local $CIDR" /etc/network/interfaces; then
+                if grep -Fq "post-up ip -6 route add local $CIDR dev $INTERFACE" /etc/network/interfaces; then
                     echo -e "${GREEN}持久化已存在，跳过。${NC}"
                     persist_success=true
                 elif grep -q "iface $INTERFACE inet6" /etc/network/interfaces; then
-                    sed -i "/iface $INTERFACE inet6/a \    post-up ip -6 route add local $CIDR dev lo || true" /etc/network/interfaces
+                    sed -i "/iface $INTERFACE inet6/a \    post-up ip -6 route add local $CIDR dev $INTERFACE || true" /etc/network/interfaces
                     echo -e "${GREEN}持久化写入 /etc/network/interfaces 成功。${NC}"
                     persist_success=true
                     ROUTE_PERSIST="true"
@@ -333,7 +333,7 @@ configure_route() {
                 cat > "$script" <<EOF
 #!/bin/sh
 # Added by outway-manager.sh for CIDR $CIDR
-ip -6 route add local $CIDR dev lo 2>/dev/null || true
+ip -6 route add local $CIDR dev $INTERFACE 2>/dev/null || true
 EOF
                 chmod +x "$script"
                 echo -e "${GREEN}路由持久化已通过 if-up.d 脚本添加。${NC}"
@@ -536,13 +536,47 @@ show_config() {
     fi
 }
 
-# ==================== 卸载（彻底清理，修复 sed 分隔符） ====================
+# ==================== 服务管理功能 ====================
+check_service_exists() {
+    if [ -f "$SYSTEMD_SERVICE" ]; then
+        return 0
+    else
+        echo -e "${RED}outway 服务未安装，请先执行安装。${NC}"
+        return 1
+    fi
+}
+
+restart_outway() {
+    check_root
+    if check_service_exists; then
+        echo -e "${BLUE}正在重启 outway 服务...${NC}"
+        systemctl restart outway
+        echo -e "${GREEN}服务已重启。${NC}"
+        systemctl status outway --no-pager
+    fi
+}
+
+stop_outway() {
+    check_root
+    if check_service_exists; then
+        echo -e "${BLUE}正在停止 outway 服务...${NC}"
+        systemctl stop outway
+        echo -e "${GREEN}服务已停止。${NC}"
+        systemctl status outway --no-pager
+    fi
+}
+
+# ==================== 卸载（彻底清理，改用物理网卡） ====================
 uninstall_outway() {
     check_root
     echo -e "${RED}=== Outway 卸载（彻底清理） ===${NC}"
     if ! load_config; then
         echo -e "${YELLOW}未找到配置文件，将跳过部分清理（但会尝试删除服务、二进制等）。${NC}"
         read -p "请输入之前使用的 CIDR（如不清楚可留空，跳过路由删除）: " CIDR
+        # 若未加载配置，INTERFACE 可能为空，提示用户输入
+        if [ -z "$INTERFACE" ]; then
+            read -p "请输入之前使用的网卡名（如 eth1，留空则默认使用 lo 删除）: " INTERFACE
+        fi
     fi
 
     if confirm_step "${YELLOW}是否停止并删除 systemd 服务？${NC}"; then
@@ -559,9 +593,9 @@ uninstall_outway() {
     fi
 
     if confirm_step "${YELLOW}是否删除路由持久化配置？${NC}"; then
-        if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ]; then
-            # 修复：使用 # 作为 sed 分隔符，避免 CIDR 中的 / 被误解析
-            sed -i "\#post-up ip -6 route add local $CIDR#d" /etc/network/interfaces
+        if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ] && [ -n "$INTERFACE" ]; then
+            # 使用 # 作为 sed 分隔符，避免 CIDR 中的 / 被误解析
+            sed -i "\#post-up ip -6 route add local $CIDR dev $INTERFACE#d" /etc/network/interfaces
             echo "已从 /etc/network/interfaces 删除持久化配置。"
         fi
         if [ -f /etc/network/if-up.d/outway-route ]; then
@@ -571,7 +605,10 @@ uninstall_outway() {
     fi
 
     if confirm_step "${YELLOW}是否删除当前路由 (ip -6 route del local $CIDR)？${NC}"; then
-        if [ -n "$CIDR" ]; then
+        if [ -n "$CIDR" ] && [ -n "$INTERFACE" ]; then
+            ip -6 route del local "$CIDR" dev "$INTERFACE" 2>/dev/null && echo "路由已删除" || echo "路由不存在或删除失败"
+        elif [ -n "$CIDR" ]; then
+            # 如果 INTERFACE 为空，尝试从 lo 删除（兼容旧版本）
             ip -6 route del local "$CIDR" dev lo 2>/dev/null && echo "路由已删除" || echo "路由不存在或删除失败"
         else
             echo "CIDR 为空，跳过。"
@@ -621,13 +658,17 @@ main_menu() {
     echo "1) 安装 Outway (交互式)"
     echo "2) 卸载 Outway (彻底清理)"
     echo "3) 查看当前配置"
-    echo "4) 退出"
-    read -p "请选择 [1-4]: " choice
+    echo "4) 重启 Outway 服务"
+    echo "5) 停止 Outway 服务"
+    echo "6) 退出"
+    read -p "请选择 [1-6]: " choice
     case $choice in
         1) interactive_install ;;
         2) uninstall_outway ;;
         3) show_config ;;
-        4) exit 0 ;;
+        4) restart_outway ;;
+        5) stop_outway ;;
+        6) exit 0 ;;
         *) echo "无效选择" ;;
     esac
 }
