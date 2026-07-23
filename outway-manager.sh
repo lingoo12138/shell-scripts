@@ -19,9 +19,8 @@ SYSTEMD_SERVICE="/etc/systemd/system/outway.service"
 
 # 默认配置（将在安装时设置）
 INTERFACE=""
-IPV6_ADDR=""          # 完整地址（含前缀长度）
-IPV6_PREFIX=""        # 格式化后的网络前缀
-CIDR=""               # 最终使用的 CIDR（可能用户自定义）
+IPV6_ADDR=""
+CIDR=""
 USERNAME=""
 PASSWORD=""
 BIND_IP="0.0.0.0"
@@ -29,6 +28,7 @@ PORT="1080"
 SYSCTL_SET="false"
 ROUTE_SET="false"
 ROUTE_PERSIST="false"
+NDPPD_SET="false"
 
 # ==================== 检测操作系统 ====================
 detect_os() {
@@ -205,7 +205,7 @@ detect_interfaces() {
     echo -e "${GREEN}已选择: $INTERFACE, IPv6: $IPV6_ADDR${NC}"
 }
 
-# ==================== 推导 CIDR（含格式化） ====================
+# ==================== 推导 CIDR ====================
 derive_cidr() {
     local base="${IPV6_ADDR%/*}"
     local prefix_len="${IPV6_ADDR#*/}"
@@ -302,7 +302,7 @@ configure_sysctl() {
     fi
 }
 
-# ==================== 配置路由（使用物理网卡 dev $INTERFACE）====================
+# ==================== 配置路由 ====================
 configure_route() {
     if confirm_step "${YELLOW}是否添加本地路由 (ip -6 route add local $CIDR dev $INTERFACE)？${NC}"; then
         if ip -6 route show table local | grep -q "$CIDR"; then
@@ -344,6 +344,53 @@ EOF
         fi
     else
         echo "跳过路由配置。"
+    fi
+}
+
+# ==================== 配置 ndppd ====================
+configure_ndppd() {
+    echo -e "${BLUE}现在需要判断您的 IPv6 是否属于“原生 IPv6”（即通过 SLAAC 自动配置）。${NC}"
+    echo "根据 zu1k 的教程：如果 VPS 的 IPv6 是原生的，则需要配置 ndppd 才能让外部网络正确路由到您的子网 IP。"
+    echo "如果是 Linode 或 He.net Tunnelbroker 这类直接路由的，则不需要。"
+    if confirm_step "${YELLOW}您的 IPv6 是原生（通过 SLAAC 获得）的吗？${NC}"; then
+        echo -e "${BLUE}正在安装并配置 ndppd...${NC}"
+        if ! command -v ndppd &>/dev/null; then
+            echo -e "${BLUE}安装 ndppd...${NC}"
+            case "$PKG_MANAGER" in
+                apt) apt update && apt install -y ndppd ;;
+                yum|dnf) echo -e "${RED}请手动安装 ndppd（您的系统不支持 apt）${NC}" ;;
+                *) echo -e "${RED}未知包管理器，请手动安装 ndppd${NC}" ;;
+            esac
+        else
+            echo -e "${GREEN}ndppd 已安装。${NC}"
+        fi
+
+        local ndppd_conf="/etc/ndppd.conf"
+        cat > "$ndppd_conf" <<EOF
+route-ttl 30000
+proxy $INTERFACE {
+    router no
+    timeout 500
+    ttl 30000
+    rule $CIDR {
+        static
+    }
+}
+EOF
+        echo -e "${GREEN}ndppd 配置文件已写入 $ndppd_conf${NC}"
+
+        systemctl enable ndppd
+        systemctl restart ndppd
+        if systemctl is-active --quiet ndppd; then
+            echo -e "${GREEN}ndppd 已启动并设为开机自启。${NC}"
+            NDPPD_SET="true"
+        else
+            echo -e "${RED}ndppd 启动失败，请检查配置或日志（journalctl -u ndppd）。${NC}"
+            NDPPD_SET="false"
+        fi
+    else
+        echo -e "${YELLOW}跳过 ndppd 配置。如果后续发现网络不通，请手动配置。${NC}"
+        NDPPD_SET="false"
     fi
 }
 
@@ -502,6 +549,7 @@ PORT="$PORT"
 SYSCTL_SET="$SYSCTL_SET"
 ROUTE_SET="$ROUTE_SET"
 ROUTE_PERSIST="$ROUTE_PERSIST"
+NDPPD_SET="$NDPPD_SET"
 EOF
     echo -e "${GREEN}配置已保存到 $CONFIG_FILE${NC}"
 }
@@ -531,12 +579,13 @@ show_config() {
         echo "sysctl 已设置: $SYSCTL_SET"
         echo "路由已设置: $ROUTE_SET"
         echo "路由持久化: $ROUTE_PERSIST"
+        echo "ndppd 已配置: $NDPPD_SET"
     else
         echo -e "${RED}未找到配置文件，请先安装。${NC}"
     fi
 }
 
-# ==================== 服务管理功能 ====================
+# ==================== 服务管理功能（Outway） ====================
 check_service_exists() {
     if [ -f "$SYSTEMD_SERVICE" ]; then
         return 0
@@ -566,14 +615,81 @@ stop_outway() {
     fi
 }
 
-# ==================== 卸载（彻底清理，改用物理网卡） ====================
+# ==================== 服务管理功能（ndppd） ====================
+check_ndppd_installed() {
+    if command -v ndppd &>/dev/null && [ -f /etc/ndppd.conf ]; then
+        return 0
+    else
+        echo -e "${RED}ndppd 未安装或未配置，请先运行安装流程。${NC}"
+        return 1
+    fi
+}
+
+start_ndppd() {
+    check_root
+    if check_ndppd_installed; then
+        echo -e "${BLUE}正在启动 ndppd 服务...${NC}"
+        systemctl start ndppd
+        echo -e "${GREEN}ndppd 已启动。${NC}"
+        systemctl status ndppd --no-pager
+    fi
+}
+
+restart_ndppd() {
+    check_root
+    if check_ndppd_installed; then
+        echo -e "${BLUE}正在重启 ndppd 服务...${NC}"
+        systemctl restart ndppd
+        echo -e "${GREEN}ndppd 已重启。${NC}"
+        systemctl status ndppd --no-pager
+    fi
+}
+
+stop_ndppd() {
+    check_root
+    if check_ndppd_installed; then
+        echo -e "${BLUE}正在停止 ndppd 服务...${NC}"
+        systemctl stop ndppd
+        echo -e "${GREEN}ndppd 已停止。${NC}"
+        systemctl status ndppd --no-pager
+    fi
+}
+
+# ==================== 查看所有服务状态 ====================
+status_all() {
+    echo -e "${BLUE}=== 服务状态总览 ===${NC}"
+
+    # outway 状态
+    if [ -f "$SYSTEMD_SERVICE" ]; then
+        echo -e "${BLUE}--- outway ---${NC}"
+        systemctl is-active --quiet outway && echo -e "状态: ${GREEN}运行中${NC}" || echo -e "状态: ${RED}已停止${NC}"
+        systemctl is-enabled --quiet outway && echo -e "开机自启: ${GREEN}已启用${NC}" || echo -e "开机自启: ${RED}未启用${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}outway 未安装。${NC}\n"
+    fi
+
+    # ndppd 状态
+    if command -v ndppd &>/dev/null && [ -f /etc/ndppd.conf ]; then
+        echo -e "${BLUE}--- ndppd ---${NC}"
+        systemctl is-active --quiet ndppd && echo -e "状态: ${GREEN}运行中${NC}" || echo -e "状态: ${RED}已停止${NC}"
+        systemctl is-enabled --quiet ndppd && echo -e "开机自启: ${GREEN}已启用${NC}" || echo -e "开机自启: ${RED}未启用${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}ndppd 未安装或未配置。${NC}\n"
+    fi
+
+    # 显示当前配置文件位置
+    echo -e "${BLUE}配置文件: $CONFIG_FILE${NC}"
+}
+
+# ==================== 卸载 ====================
 uninstall_outway() {
     check_root
     echo -e "${RED}=== Outway 卸载（彻底清理） ===${NC}"
     if ! load_config; then
         echo -e "${YELLOW}未找到配置文件，将跳过部分清理（但会尝试删除服务、二进制等）。${NC}"
         read -p "请输入之前使用的 CIDR（如不清楚可留空，跳过路由删除）: " CIDR
-        # 若未加载配置，INTERFACE 可能为空，提示用户输入
         if [ -z "$INTERFACE" ]; then
             read -p "请输入之前使用的网卡名（如 eth1，留空则默认使用 lo 删除）: " INTERFACE
         fi
@@ -594,7 +710,6 @@ uninstall_outway() {
 
     if confirm_step "${YELLOW}是否删除路由持久化配置？${NC}"; then
         if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ] && [ -n "$INTERFACE" ]; then
-            # 使用 # 作为 sed 分隔符，避免 CIDR 中的 / 被误解析
             sed -i "\#post-up ip -6 route add local $CIDR dev $INTERFACE#d" /etc/network/interfaces
             echo "已从 /etc/network/interfaces 删除持久化配置。"
         fi
@@ -608,10 +723,21 @@ uninstall_outway() {
         if [ -n "$CIDR" ] && [ -n "$INTERFACE" ]; then
             ip -6 route del local "$CIDR" dev "$INTERFACE" 2>/dev/null && echo "路由已删除" || echo "路由不存在或删除失败"
         elif [ -n "$CIDR" ]; then
-            # 如果 INTERFACE 为空，尝试从 lo 删除（兼容旧版本）
             ip -6 route del local "$CIDR" dev lo 2>/dev/null && echo "路由已删除" || echo "路由不存在或删除失败"
         else
             echo "CIDR 为空，跳过。"
+        fi
+    fi
+
+    if [ "$NDPPD_SET" = "true" ] || confirm_step "${YELLOW}是否停止并卸载 ndppd？${NC}"; then
+        if systemctl is-active --quiet ndppd; then
+            systemctl stop ndppd
+            systemctl disable ndppd
+            echo "ndppd 已停止并禁用。"
+        fi
+        if confirm_step "${YELLOW}是否删除 ndppd 配置文件 (/etc/ndppd.conf)？${NC}"; then
+            rm -f /etc/ndppd.conf
+            echo "ndppd 配置文件已删除。"
         fi
     fi
 
@@ -643,6 +769,7 @@ interactive_install() {
     set_port
     configure_sysctl
     configure_route
+    configure_ndppd
     install_outway
     create_systemd
     save_config
@@ -650,6 +777,11 @@ interactive_install() {
     echo "代理地址：$BIND_IP:$PORT"
     echo "用户名：$USERNAME，密码：$PASSWORD"
     echo "配置文件：$CONFIG_FILE"
+    if [ "$NDPPD_SET" = "true" ]; then
+        echo -e "${GREEN}ndppd 已配置并启动。${NC}"
+    else
+        echo -e "${YELLOW}注意：您未配置 ndppd，如果您的 IPv6 是原生的，请手动配置以确保网络连通。${NC}"
+    fi
 }
 
 # ==================== 主菜单 ====================
@@ -660,15 +792,23 @@ main_menu() {
     echo "3) 查看当前配置"
     echo "4) 重启 Outway 服务"
     echo "5) 停止 Outway 服务"
-    echo "6) 退出"
-    read -p "请选择 [1-6]: " choice
+    echo "6) 启动 ndppd 服务"
+    echo "7) 重启 ndppd 服务"
+    echo "8) 停止 ndppd 服务"
+    echo "9) 查看所有服务状态"
+    echo "10) 退出"
+    read -p "请选择 [1-10]: " choice
     case $choice in
         1) interactive_install ;;
         2) uninstall_outway ;;
         3) show_config ;;
         4) restart_outway ;;
         5) stop_outway ;;
-        6) exit 0 ;;
+        6) start_ndppd ;;
+        7) restart_ndppd ;;
+        8) stop_ndppd ;;
+        9) status_all ;;
+        10) exit 0 ;;
         *) echo "无效选择" ;;
     esac
 }
