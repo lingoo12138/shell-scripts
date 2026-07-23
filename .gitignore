@@ -1,0 +1,12 @@
+# 临时文件
+*.tmp
+*.swp
+*.bak
+
+# 系统配置(敏感)
+*.conf.local
+.env
+.env.local
+
+# Outway 本地配置
+etc/
