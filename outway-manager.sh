@@ -290,7 +290,7 @@ configure_sysctl() {
         local line="net.ipv6.ip_nonlocal_bind=1"
         if ! grep -q "^$line$" "$sysctl_file"; then
             echo "$line" >> "$sysctl_file"
-            sysctl -p
+            sysctl -p || echo -e "${YELLOW}sysctl -p 执行失败，请检查 /etc/sysctl.conf 语法${NC}"
             echo -e "${GREEN}sysctl 已配置。${NC}"
             SYSCTL_SET="true"
         else
@@ -302,10 +302,10 @@ configure_sysctl() {
     fi
 }
 
-# ==================== 配置路由（改进持久化） ====================
+# ==================== 配置路由（修复：检查 local 表，使用 grep -F）====================
 configure_route() {
     if confirm_step "${YELLOW}是否添加本地路由 (ip -6 route add local $CIDR dev lo)？${NC}"; then
-        if ip -6 route show | grep -q "$CIDR"; then
+        if ip -6 route show table local | grep -q "$CIDR"; then
             echo -e "${GREEN}路由已存在，跳过添加。${NC}"
         else
             ip -6 route add local "$CIDR" dev lo
@@ -316,7 +316,7 @@ configure_route() {
         if confirm_step "${YELLOW}是否将路由持久化？${NC}"; then
             local persist_success=false
             if [ -f /etc/network/interfaces ]; then
-                if grep -q "post-up ip -6 route add local $CIDR" /etc/network/interfaces; then
+                if grep -Fq "post-up ip -6 route add local $CIDR" /etc/network/interfaces; then
                     echo -e "${GREEN}持久化已存在，跳过。${NC}"
                     persist_success=true
                 elif grep -q "iface $INTERFACE inet6" /etc/network/interfaces; then
@@ -347,7 +347,7 @@ EOF
     fi
 }
 
-# ==================== 安装 outway（修正下载 URL + 灵活查找二进制）====================
+# ==================== 安装 outway ====================
 install_outway() {
     echo -e "${BLUE}请选择安装方式：${NC}"
     echo "  1) 下载预编译二进制（推荐）"
@@ -414,12 +414,9 @@ install_outway() {
 
         tar xzf outway.tar.gz
 
-        # ========== 修正点：匹配任何以 outway 开头的可执行文件 ==========
         local binary_path=""
-        # 查找可执行文件，名称以 outway 开头
         binary_path=$(find . -type f -executable -name "outway*" -print -quit 2>/dev/null || true)
         if [ -z "$binary_path" ]; then
-            # 如果没有可执行权限，查找普通文件
             binary_path=$(find . -type f -name "outway*" -print -quit 2>/dev/null || true)
         fi
 
@@ -430,7 +427,6 @@ install_outway() {
             cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
         fi
 
-        # 复制到目标位置，并重命名为 outway
         cp "$binary_path" "$OUTWAY_BIN"
         chmod +x "$OUTWAY_BIN"
         echo -e "${GREEN}outway 已安装到 $OUTWAY_BIN（源文件：$binary_path）${NC}"
@@ -483,7 +479,7 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable outway
-        systemctl start outway
+        systemctl start outway || { echo -e "${RED}服务启动失败，请检查日志${NC}"; return 1; }
         echo -e "${GREEN}systemd 服务已创建并启动。${NC}"
         systemctl status outway --no-pager
     else
@@ -540,7 +536,7 @@ show_config() {
     fi
 }
 
-# ==================== 卸载（彻底清理） ====================
+# ==================== 卸载（彻底清理，修复 sed 分隔符） ====================
 uninstall_outway() {
     check_root
     echo -e "${RED}=== Outway 卸载（彻底清理） ===${NC}"
@@ -564,7 +560,8 @@ uninstall_outway() {
 
     if confirm_step "${YELLOW}是否删除路由持久化配置？${NC}"; then
         if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ]; then
-            sed -i "/post-up ip -6 route add local $CIDR/d" /etc/network/interfaces
+            # 修复：使用 # 作为 sed 分隔符，避免 CIDR 中的 / 被误解析
+            sed -i "\#post-up ip -6 route add local $CIDR#d" /etc/network/interfaces
             echo "已从 /etc/network/interfaces 删除持久化配置。"
         fi
         if [ -f /etc/network/if-up.d/outway-route ]; then
