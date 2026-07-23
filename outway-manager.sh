@@ -19,8 +19,9 @@ SYSTEMD_SERVICE="/etc/systemd/system/outway.service"
 
 # 默认配置（将在安装时设置）
 INTERFACE=""
-IPV6_ADDR=""
-CIDR=""
+IPV6_ADDR=""          # 完整地址（含前缀长度）
+IPV6_PREFIX=""        # 格式化后的网络前缀
+CIDR=""               # 最终使用的 CIDR（可能用户自定义）
 USERNAME=""
 PASSWORD=""
 BIND_IP="0.0.0.0"
@@ -61,8 +62,149 @@ generate_password() {
 }
 
 generate_random_port() {
-    # 生成 10000-65535 之间的随机端口
     echo $(( (RANDOM % 55536) + 10000 ))
+}
+
+# ==================== IPv6 网络前缀格式化 ====================
+get_network_prefix() {
+    local input="$1"
+    # 输入格式：地址/前缀长度，例如 2001:db8:1234:5678:abcd:ef01:2345:6789/64
+    local addr="${input%/*}"
+    local prefix="${input#*/}"
+    # 如果前缀长度为空或不是数字，默认64
+    if ! [[ "$prefix" =~ ^[0-9]+$ ]] || [ "$prefix" -lt 0 ] || [ "$prefix" -gt 128 ]; then
+        prefix=64
+    fi
+
+    # 将地址拆分为8组（可能包含缩写），这里用冒号分割，然后补齐为8组
+    IFS=':' read -ra groups <<< "$addr"
+    # 处理 :: 缩写（展开为连续的零组）
+    local full_groups=()
+    local empty_index=-1
+    local count=0
+    for i in "${!groups[@]}"; do
+        if [ -z "${groups[$i]}" ]; then
+            empty_index=$i
+        else
+            ((count++))
+        fi
+    done
+    # 计算需要补零的组数
+    local missing=$((8 - count))
+    if [ $empty_index -ne -1 ]; then
+        # 展开 :: 为 missing 个零组
+        local new_groups=()
+        for ((i=0; i<${#groups[@]}; i++)); do
+            if [ -z "${groups[$i]}" ]; then
+                for ((j=0; j<missing; j++)); do
+                    new_groups+=( "0" )
+                done
+            else
+                new_groups+=( "${groups[$i]}" )
+            fi
+        done
+        groups=("${new_groups[@]}")
+    else
+        # 如果没有 ::，但可能只有少于8组，补零到8组（但通常不会）
+        while [ ${#groups[@]} -lt 8 ]; do
+            groups+=( "0" )
+        done
+    fi
+
+    # 现在 groups 应有8个元素
+    # 计算需要保留的位数
+    local bits=$prefix
+    local full_hex=""
+    for ((i=0; i<8; i++)); do
+        # 每组16位，但可能部分保留
+        local group_hex="${groups[$i]}"
+        # 补齐为4位十六进制
+        while [ ${#group_hex} -lt 4 ]; do
+            group_hex="0$group_hex"
+        done
+        if [ $bits -ge 16 ]; then
+            # 完全保留
+            full_hex+="$group_hex"
+            bits=$((bits - 16))
+        elif [ $bits -gt 0 ]; then
+            # 部分保留（仅保留前 bits 位，后位置零）
+            local mask_bits=$bits
+            local val_hex=$group_hex
+            # 将十六进制转为二进制掩码，简单做法：取前 bits 位，后面补零
+            # 由于bits小于16，我们转换为十进制，掩码后转回十六进制
+            local val_dec=$((16#$val_hex))
+            local mask=$(( (1 << (16 - mask_bits)) - 1 ))
+            mask=$(( ~mask & 0xFFFF ))
+            local new_val=$((val_dec & mask))
+            # 转回4位十六进制
+            local new_hex=$(printf "%04x" $new_val)
+            full_hex+="$new_hex"
+            bits=0
+        else
+            # 完全不要该组，补零
+            full_hex+="0000"
+        fi
+    done
+
+    # 将 full_hex 每4位一组重新划分为8组
+    local final_groups=()
+    for ((i=0; i<8; i++)); do
+        local start=$((i*4))
+        local group="${full_hex:$start:4}"
+        # 去除前导零（但保留至少一个字符）
+        group=$(echo "$group" | sed 's/^0*//')
+        [ -z "$group" ] && group="0"
+        final_groups+=( "$group" )
+    done
+
+    # 压缩表示（合并连续的零组为 ::）
+    local compressed=""
+    local zero_run=0
+    local max_zero_run=0
+    local run_start=-1
+    # 先找出最长的连续零组
+    for ((i=0; i<8; i++)); do
+        if [ "${final_groups[$i]}" = "0" ]; then
+            if [ $zero_run -eq 0 ]; then
+                run_start=$i
+            fi
+            ((zero_run++))
+        else
+            if [ $zero_run -gt $max_zero_run ]; then
+                max_zero_run=$zero_run
+                # 记录要压缩的起始位置
+            fi
+            zero_run=0
+        fi
+    done
+    if [ $zero_run -gt $max_zero_run ]; then
+        max_zero_run=$zero_run
+        run_start=$((8 - zero_run))
+    fi
+
+    # 构建压缩字符串
+    local parts=()
+    if [ $max_zero_run -ge 2 ]; then
+        for ((i=0; i<8; i++)); do
+            if [ $i -eq $run_start ]; then
+                parts+=( "" )
+                i=$((i + max_zero_run - 1))
+            else
+                parts+=( "${final_groups[$i]}" )
+            fi
+        done
+        compressed=$(IFS=: ; echo "${parts[*]}")
+        # 处理连续的冒号
+        compressed=$(echo "$compressed" | sed 's/:::/:/g' | sed 's/::/::/g')
+        # 如果开头或结尾有冒号，补充
+        if [ -z "${parts[0]}" ]; then compressed=":$compressed"; fi
+        if [ -z "${parts[-1]}" ]; then compressed="$compressed:"; fi
+    else
+        compressed=$(IFS=: ; echo "${final_groups[*]}")
+    fi
+
+    # 返回 /prefix 格式
+    echo "${compressed}/${prefix}"
 }
 
 # ==================== 网卡检测 ====================
@@ -90,33 +232,49 @@ detect_interfaces() {
     echo -e "${GREEN}已选择: $INTERFACE, IPv6: $IPV6_ADDR${NC}"
 }
 
-# ==================== 推导 CIDR ====================
+# ==================== 推导 CIDR（含格式化） ====================
 derive_cidr() {
     local base="${IPV6_ADDR%/*}"
     local prefix_len="${IPV6_ADDR#*/}"
     echo -e "${BLUE}当前网卡的 IPv6 前缀长度为 /$prefix_len${NC}"
     echo "请选择你希望 outway 使用的 CIDR 块："
-    echo "  1) 使用当前网卡的 /$prefix_len (直接使用现有段)"
-    echo "  2) 使用 /56 (如果你的上游分配了 /56 子网)"
+    echo "  1) 使用当前网卡的 /$prefix_len（自动格式化为网络前缀）"
+    echo "  2) 使用 /56（如果你的上游分配了 /56 子网）"
     echo "  3) 手动输入 CIDR"
     read -p "请选择 [1-3]: " cidr_choice
     case $cidr_choice in
-        1) CIDR="$IPV6_ADDR" ;;
+        1)
+            # 调用格式化函数，得到网络前缀
+            CIDR=$(get_network_prefix "$IPV6_ADDR")
+            echo -e "${GREEN}格式化后的网络前缀: $CIDR${NC}"
+            ;;
         2)
-            local segments=(${base//:/ })
-            if [ ${#segments[@]} -ge 4 ]; then
-                local seg3="${segments[3]}"
+            # 基于完整地址提取前 56 位（即前 4 组中的前 56 位）
+            local addr_no_prefix="${IPV6_ADDR%/*}"
+            # 展开完整地址
+            local full_addr=$(get_network_prefix "${addr_no_prefix}/128" | cut -d'/' -f1)
+            # 取前 4 组，第4组截取前两位（8位）
+            IFS=':' read -ra segs <<< "$full_addr"
+            if [ ${#segs[@]} -ge 4 ]; then
+                local seg3="${segs[3]}"
                 local seg3_prefix="${seg3:0:2}"
-                CIDR="${segments[0]}:${segments[1]}:${segments[2]}:${seg3_prefix}00::/56"
+                # 确保前缀长度为2位（如果不足补0）
+                while [ ${#seg3_prefix} -lt 2 ]; do seg3_prefix="0$seg3_prefix"; done
+                CIDR="${segs[0]}:${segs[1]}:${segs[2]}:${seg3_prefix}00::/56"
+                echo -e "${GREEN}生成的 /56 前缀: $CIDR${NC}"
             else
                 echo -e "${RED}无法自动截取 /56，请手动输入。${NC}"
                 read -p "请输入 CIDR: " CIDR
             fi
             ;;
-        3) read -p "请输入 CIDR: " CIDR ;;
-        *) echo -e "${RED}无效选择${NC}"; exit 1 ;;
+        3)
+            read -p "请输入 CIDR: " CIDR
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"; exit 1
+            ;;
     esac
-    echo -e "${GREEN}将使用的 CIDR: $CIDR${NC}"
+    echo -e "${GREEN}最终使用的 CIDR: $CIDR${NC}"
 }
 
 # ==================== 设置认证 ====================
@@ -211,7 +369,7 @@ configure_route() {
     fi
 }
 
-# ==================== 安装 outway ====================
+# ==================== 安装 outway（改进版）====================
 install_outway() {
     echo -e "${BLUE}请选择安装方式：${NC}"
     echo "  1) 下载预编译二进制（推荐）"
@@ -228,23 +386,62 @@ install_outway() {
             armv7l) arch="arm" ;;
             *) echo -e "${RED}不支持的架构: $arch${NC}"; exit 1 ;;
         esac
+        echo -e "${GREEN}检测到架构: $arch${NC}"
+
         local latest_url="https://api.github.com/repos/xiaozhou26/outway/releases/latest"
-        local tag=$(curl -s "$latest_url" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+        echo -e "${BLUE}正在获取最新版本信息...${NC}"
+        local tag
+        tag=$(curl -s --connect-timeout 10 --max-time 20 "$latest_url" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
         if [ -z "$tag" ]; then
-            echo -e "${RED}获取最新版本失败，请检查网络。${NC}"
-            exit 1
+            echo -e "${RED}获取最新版本失败，请检查网络或 GitHub API 限制。${NC}"
+            echo -e "${YELLOW}你可以手动指定版本，例如 v0.1.0${NC}"
+            read -p "请输入版本标签（留空退出）: " manual_tag
+            if [ -z "$manual_tag" ]; then
+                exit 1
+            else
+                tag="$manual_tag"
+            fi
         fi
+        echo -e "${GREEN}最新版本: $tag${NC}"
+
         local download_url="https://github.com/xiaozhou26/outway/releases/download/$tag/outway_${tag#v}_linux_$arch.tar.gz"
+        echo -e "${BLUE}下载 URL: $download_url${NC}"
+
         local tmp_dir=$(mktemp -d)
         cd "$tmp_dir"
-        wget -q --show-progress "$download_url" -O outway.tar.gz
+        echo -e "${BLUE}正在下载到 $tmp_dir/outway.tar.gz ...${NC}"
+
+        if command -v wget &>/dev/null; then
+            if wget --timeout=30 --tries=3 --show-progress "$download_url" -O outway.tar.gz; then
+                echo -e "${GREEN}wget 下载成功${NC}"
+            else
+                echo -e "${YELLOW}wget 下载失败，尝试使用 curl...${NC}"
+                if ! curl -L --connect-timeout 30 --max-time 60 "$download_url" -o outway.tar.gz; then
+                    echo -e "${RED}所有下载方式均失败${NC}"
+                    cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
+                fi
+            fi
+        else
+            echo -e "${YELLOW}wget 未安装，使用 curl...${NC}"
+            if ! curl -L --connect-timeout 30 --max-time 60 "$download_url" -o outway.tar.gz; then
+                echo -e "${RED}curl 下载失败${NC}"
+                cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
+            fi
+        fi
+
+        if ! tar -tzf outway.tar.gz &>/dev/null; then
+            echo -e "${RED}下载的文件无效或损坏，请检查 URL 或网络。${NC}"
+            cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
+        fi
+
         tar xzf outway.tar.gz
         if [ -f "outway" ]; then
             cp outway "$OUTWAY_BIN"
             chmod +x "$OUTWAY_BIN"
             echo -e "${GREEN}outway 已安装到 $OUTWAY_BIN${NC}"
         else
-            echo -e "${RED}解压失败${NC}"; exit 1
+            echo -e "${RED}解压后未找到 outway 二进制文件${NC}"
+            cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
         fi
         cd - >/dev/null
         rm -rf "$tmp_dir"
@@ -360,7 +557,6 @@ uninstall_outway() {
         read -p "请输入之前使用的 CIDR（如不清楚可留空，跳过路由删除）: " CIDR
     fi
 
-    # 删除 systemd 服务
     if confirm_step "${YELLOW}是否停止并删除 systemd 服务？${NC}"; then
         systemctl stop outway 2>/dev/null || true
         systemctl disable outway 2>/dev/null || true
@@ -369,13 +565,11 @@ uninstall_outway() {
         echo "systemd 服务已删除。"
     fi
 
-    # 删除二进制
     if confirm_step "${YELLOW}是否删除 outway 二进制 ($OUTWAY_BIN)？${NC}"; then
         rm -f "$OUTWAY_BIN"
         echo "二进制已删除。"
     fi
 
-    # 删除路由持久化
     if confirm_step "${YELLOW}是否删除路由持久化配置 (从 /etc/network/interfaces)？${NC}"; then
         if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ]; then
             sed -i "/post-up ip -6 route add local $CIDR/d" /etc/network/interfaces
@@ -385,7 +579,6 @@ uninstall_outway() {
         fi
     fi
 
-    # 删除当前路由
     if confirm_step "${YELLOW}是否删除当前路由 (ip -6 route del local $CIDR)？${NC}"; then
         if [ -n "$CIDR" ]; then
             ip -6 route del local "$CIDR" dev lo 2>/dev/null && echo "路由已删除" || echo "路由不存在或删除失败"
@@ -394,17 +587,14 @@ uninstall_outway() {
         fi
     fi
 
-    # 删除 sysctl 设置（精确匹配）
     if [ "$SYSCTL_SET" = "true" ] || confirm_step "${YELLOW}是否从 /etc/sysctl.conf 中删除 net.ipv6.ip_nonlocal_bind=1？${NC}"; then
         if [ -f /etc/sysctl.conf ]; then
-            # 精确删除匹配行（整行）
             sed -i '/^net\.ipv6\.ip_nonlocal_bind=1$/d' /etc/sysctl.conf
             sysctl -p
             echo "sysctl 配置已删除。"
         fi
     fi
 
-    # 删除配置文件
     if confirm_step "${YELLOW}是否删除配置文件 ($CONFIG_FILE)？${NC}"; then
         rm -f "$CONFIG_FILE"
         rmdir "$CONFIG_DIR" 2>/dev/null || true
