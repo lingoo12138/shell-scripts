@@ -68,17 +68,13 @@ generate_random_port() {
 # ==================== IPv6 网络前缀格式化 ====================
 get_network_prefix() {
     local input="$1"
-    # 输入格式：地址/前缀长度，例如 2001:db8:1234:5678:abcd:ef01:2345:6789/64
     local addr="${input%/*}"
     local prefix="${input#*/}"
-    # 如果前缀长度为空或不是数字，默认64
     if ! [[ "$prefix" =~ ^[0-9]+$ ]] || [ "$prefix" -lt 0 ] || [ "$prefix" -gt 128 ]; then
         prefix=64
     fi
 
-    # 将地址拆分为8组（可能包含缩写），这里用冒号分割，然后补齐为8组
     IFS=':' read -ra groups <<< "$addr"
-    # 处理 :: 缩写（展开为连续的零组）
     local full_groups=()
     local empty_index=-1
     local count=0
@@ -89,10 +85,8 @@ get_network_prefix() {
             ((count++))
         fi
     done
-    # 计算需要补零的组数
     local missing=$((8 - count))
     if [ $empty_index -ne -1 ]; then
-        # 展开 :: 为 missing 个零组
         local new_groups=()
         for ((i=0; i<${#groups[@]}; i++)); do
             if [ -z "${groups[$i]}" ]; then
@@ -105,64 +99,48 @@ get_network_prefix() {
         done
         groups=("${new_groups[@]}")
     else
-        # 如果没有 ::，但可能只有少于8组，补零到8组（但通常不会）
         while [ ${#groups[@]} -lt 8 ]; do
             groups+=( "0" )
         done
     fi
 
-    # 现在 groups 应有8个元素
-    # 计算需要保留的位数
     local bits=$prefix
     local full_hex=""
     for ((i=0; i<8; i++)); do
-        # 每组16位，但可能部分保留
         local group_hex="${groups[$i]}"
-        # 补齐为4位十六进制
         while [ ${#group_hex} -lt 4 ]; do
             group_hex="0$group_hex"
         done
         if [ $bits -ge 16 ]; then
-            # 完全保留
             full_hex+="$group_hex"
             bits=$((bits - 16))
         elif [ $bits -gt 0 ]; then
-            # 部分保留（仅保留前 bits 位，后位置零）
             local mask_bits=$bits
-            local val_hex=$group_hex
-            # 将十六进制转为二进制掩码，简单做法：取前 bits 位，后面补零
-            # 由于bits小于16，我们转换为十进制，掩码后转回十六进制
-            local val_dec=$((16#$val_hex))
+            local val_dec=$((16#$group_hex))
             local mask=$(( (1 << (16 - mask_bits)) - 1 ))
             mask=$(( ~mask & 0xFFFF ))
             local new_val=$((val_dec & mask))
-            # 转回4位十六进制
             local new_hex=$(printf "%04x" $new_val)
             full_hex+="$new_hex"
             bits=0
         else
-            # 完全不要该组，补零
             full_hex+="0000"
         fi
     done
 
-    # 将 full_hex 每4位一组重新划分为8组
     local final_groups=()
     for ((i=0; i<8; i++)); do
         local start=$((i*4))
         local group="${full_hex:$start:4}"
-        # 去除前导零（但保留至少一个字符）
         group=$(echo "$group" | sed 's/^0*//')
         [ -z "$group" ] && group="0"
         final_groups+=( "$group" )
     done
 
-    # 压缩表示（合并连续的零组为 ::）
     local compressed=""
     local zero_run=0
     local max_zero_run=0
     local run_start=-1
-    # 先找出最长的连续零组
     for ((i=0; i<8; i++)); do
         if [ "${final_groups[$i]}" = "0" ]; then
             if [ $zero_run -eq 0 ]; then
@@ -172,7 +150,6 @@ get_network_prefix() {
         else
             if [ $zero_run -gt $max_zero_run ]; then
                 max_zero_run=$zero_run
-                # 记录要压缩的起始位置
             fi
             zero_run=0
         fi
@@ -182,7 +159,6 @@ get_network_prefix() {
         run_start=$((8 - zero_run))
     fi
 
-    # 构建压缩字符串
     local parts=()
     if [ $max_zero_run -ge 2 ]; then
         for ((i=0; i<8; i++)); do
@@ -194,16 +170,13 @@ get_network_prefix() {
             fi
         done
         compressed=$(IFS=: ; echo "${parts[*]}")
-        # 处理连续的冒号
         compressed=$(echo "$compressed" | sed 's/:::/:/g' | sed 's/::/::/g')
-        # 如果开头或结尾有冒号，补充
         if [ -z "${parts[0]}" ]; then compressed=":$compressed"; fi
         if [ -z "${parts[-1]}" ]; then compressed="$compressed:"; fi
     else
         compressed=$(IFS=: ; echo "${final_groups[*]}")
     fi
 
-    # 返回 /prefix 格式
     echo "${compressed}/${prefix}"
 }
 
@@ -341,7 +314,6 @@ configure_route() {
         ROUTE_SET="true"
 
         if confirm_step "${YELLOW}是否将路由持久化？${NC}"; then
-            # 尝试通过 /etc/network/interfaces 持久化
             local persist_success=false
             if [ -f /etc/network/interfaces ]; then
                 if grep -q "post-up ip -6 route add local $CIDR" /etc/network/interfaces; then
@@ -355,7 +327,6 @@ configure_route() {
                 fi
             fi
 
-            # 如果上述方法失败，使用 /etc/network/if-up.d/ 脚本
             if [ "$persist_success" = false ]; then
                 echo -e "${YELLOW}未找到网卡 $INTERFACE 的 IPv6 配置段，将改用 if-up.d 脚本持久化。${NC}"
                 local script="/etc/network/if-up.d/outway-route"
@@ -376,7 +347,7 @@ EOF
     fi
 }
 
-# ==================== 安装 outway（修正下载 URL）====================
+# ==================== 安装 outway（修正下载 URL + 灵活查找二进制）====================
 install_outway() {
     echo -e "${BLUE}请选择安装方式：${NC}"
     echo "  1) 下载预编译二进制（推荐）"
@@ -411,7 +382,6 @@ install_outway() {
         fi
         echo -e "${GREEN}最新版本: $tag${NC}"
 
-        # 修正：文件名格式为 outway-linux-$arch.tar.gz（不包含版本号）
         local download_url="https://github.com/xiaozhou26/outway/releases/download/$tag/outway-linux-$arch.tar.gz"
         echo -e "${BLUE}下载 URL: $download_url${NC}"
 
@@ -443,14 +413,28 @@ install_outway() {
         fi
 
         tar xzf outway.tar.gz
-        if [ -f "outway" ]; then
-            cp outway "$OUTWAY_BIN"
-            chmod +x "$OUTWAY_BIN"
-            echo -e "${GREEN}outway 已安装到 $OUTWAY_BIN${NC}"
-        else
-            echo -e "${RED}解压后未找到 outway 二进制文件${NC}"
+
+        # ========== 修正点：匹配任何以 outway 开头的可执行文件 ==========
+        local binary_path=""
+        # 查找可执行文件，名称以 outway 开头
+        binary_path=$(find . -type f -executable -name "outway*" -print -quit 2>/dev/null || true)
+        if [ -z "$binary_path" ]; then
+            # 如果没有可执行权限，查找普通文件
+            binary_path=$(find . -type f -name "outway*" -print -quit 2>/dev/null || true)
+        fi
+
+        if [ -z "$binary_path" ]; then
+            echo -e "${RED}解压后未找到 outway 二进制文件。请检查压缩包内容。${NC}"
+            echo "当前目录内容："
+            ls -la
             cd - >/dev/null; rm -rf "$tmp_dir"; exit 1
         fi
+
+        # 复制到目标位置，并重命名为 outway
+        cp "$binary_path" "$OUTWAY_BIN"
+        chmod +x "$OUTWAY_BIN"
+        echo -e "${GREEN}outway 已安装到 $OUTWAY_BIN（源文件：$binary_path）${NC}"
+
         cd - >/dev/null
         rm -rf "$tmp_dir"
     else
@@ -579,12 +563,10 @@ uninstall_outway() {
     fi
 
     if confirm_step "${YELLOW}是否删除路由持久化配置？${NC}"; then
-        # 删除 /etc/network/interfaces 中的 post-up
         if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ]; then
             sed -i "/post-up ip -6 route add local $CIDR/d" /etc/network/interfaces
             echo "已从 /etc/network/interfaces 删除持久化配置。"
         fi
-        # 删除 if-up.d 脚本
         if [ -f /etc/network/if-up.d/outway-route ]; then
             rm -f /etc/network/if-up.d/outway-route
             echo "已删除 /etc/network/if-up.d/outway-route。"
