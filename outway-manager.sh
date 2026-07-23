@@ -244,21 +244,16 @@ derive_cidr() {
     read -p "请选择 [1-3]: " cidr_choice
     case $cidr_choice in
         1)
-            # 调用格式化函数，得到网络前缀
             CIDR=$(get_network_prefix "$IPV6_ADDR")
             echo -e "${GREEN}格式化后的网络前缀: $CIDR${NC}"
             ;;
         2)
-            # 基于完整地址提取前 56 位（即前 4 组中的前 56 位）
             local addr_no_prefix="${IPV6_ADDR%/*}"
-            # 展开完整地址
             local full_addr=$(get_network_prefix "${addr_no_prefix}/128" | cut -d'/' -f1)
-            # 取前 4 组，第4组截取前两位（8位）
             IFS=':' read -ra segs <<< "$full_addr"
             if [ ${#segs[@]} -ge 4 ]; then
                 local seg3="${segs[3]}"
                 local seg3_prefix="${seg3:0:2}"
-                # 确保前缀长度为2位（如果不足补0）
                 while [ ${#seg3_prefix} -lt 2 ]; do seg3_prefix="0$seg3_prefix"; done
                 CIDR="${segs[0]}:${segs[1]}:${segs[2]}:${seg3_prefix}00::/56"
                 echo -e "${GREEN}生成的 /56 前缀: $CIDR${NC}"
@@ -334,7 +329,7 @@ configure_sysctl() {
     fi
 }
 
-# ==================== 配置路由 ====================
+# ==================== 配置路由（改进持久化） ====================
 configure_route() {
     if confirm_step "${YELLOW}是否添加本地路由 (ip -6 route add local $CIDR dev lo)？${NC}"; then
         if ip -6 route show | grep -q "$CIDR"; then
@@ -344,22 +339,34 @@ configure_route() {
             echo -e "${GREEN}路由添加成功。${NC}"
         fi
         ROUTE_SET="true"
-        if confirm_step "${YELLOW}是否将路由持久化到 /etc/network/interfaces？${NC}"; then
+
+        if confirm_step "${YELLOW}是否将路由持久化？${NC}"; then
+            # 尝试通过 /etc/network/interfaces 持久化
+            local persist_success=false
             if [ -f /etc/network/interfaces ]; then
                 if grep -q "post-up ip -6 route add local $CIDR" /etc/network/interfaces; then
                     echo -e "${GREEN}持久化已存在，跳过。${NC}"
-                else
-                    if grep -q "iface $INTERFACE inet6" /etc/network/interfaces; then
-                        sed -i "/iface $INTERFACE inet6/a \    post-up ip -6 route add local $CIDR dev lo || true" /etc/network/interfaces
-                        echo -e "${GREEN}持久化写入成功。${NC}"
-                        ROUTE_PERSIST="true"
-                    else
-                        echo -e "${RED}未找到网卡 $INTERFACE 的 IPv6 配置段，无法自动持久化。${NC}"
-                        echo "请手动添加：ip -6 route add local $CIDR dev lo"
-                    fi
+                    persist_success=true
+                elif grep -q "iface $INTERFACE inet6" /etc/network/interfaces; then
+                    sed -i "/iface $INTERFACE inet6/a \    post-up ip -6 route add local $CIDR dev lo || true" /etc/network/interfaces
+                    echo -e "${GREEN}持久化写入 /etc/network/interfaces 成功。${NC}"
+                    persist_success=true
+                    ROUTE_PERSIST="true"
                 fi
-            else
-                echo -e "${RED}/etc/network/interfaces 不存在，请手动持久化。${NC}"
+            fi
+
+            # 如果上述方法失败，使用 /etc/network/if-up.d/ 脚本
+            if [ "$persist_success" = false ]; then
+                echo -e "${YELLOW}未找到网卡 $INTERFACE 的 IPv6 配置段，将改用 if-up.d 脚本持久化。${NC}"
+                local script="/etc/network/if-up.d/outway-route"
+                cat > "$script" <<EOF
+#!/bin/sh
+# Added by outway-manager.sh for CIDR $CIDR
+ip -6 route add local $CIDR dev lo 2>/dev/null || true
+EOF
+                chmod +x "$script"
+                echo -e "${GREEN}路由持久化已通过 if-up.d 脚本添加。${NC}"
+                ROUTE_PERSIST="true"
             fi
         else
             echo "跳过持久化。"
@@ -369,7 +376,7 @@ configure_route() {
     fi
 }
 
-# ==================== 安装 outway（改进版）====================
+# ==================== 安装 outway（修正下载 URL）====================
 install_outway() {
     echo -e "${BLUE}请选择安装方式：${NC}"
     echo "  1) 下载预编译二进制（推荐）"
@@ -394,7 +401,7 @@ install_outway() {
         tag=$(curl -s --connect-timeout 10 --max-time 20 "$latest_url" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
         if [ -z "$tag" ]; then
             echo -e "${RED}获取最新版本失败，请检查网络或 GitHub API 限制。${NC}"
-            echo -e "${YELLOW}你可以手动指定版本，例如 v0.1.0${NC}"
+            echo -e "${YELLOW}你可以手动指定版本，例如 v0.5.0${NC}"
             read -p "请输入版本标签（留空退出）: " manual_tag
             if [ -z "$manual_tag" ]; then
                 exit 1
@@ -404,7 +411,8 @@ install_outway() {
         fi
         echo -e "${GREEN}最新版本: $tag${NC}"
 
-        local download_url="https://github.com/xiaozhou26/outway/releases/download/$tag/outway_${tag#v}_linux_$arch.tar.gz"
+        # 修正：文件名格式为 outway-linux-$arch.tar.gz（不包含版本号）
+        local download_url="https://github.com/xiaozhou26/outway/releases/download/$tag/outway-linux-$arch.tar.gz"
         echo -e "${BLUE}下载 URL: $download_url${NC}"
 
         local tmp_dir=$(mktemp -d)
@@ -570,12 +578,16 @@ uninstall_outway() {
         echo "二进制已删除。"
     fi
 
-    if confirm_step "${YELLOW}是否删除路由持久化配置 (从 /etc/network/interfaces)？${NC}"; then
+    if confirm_step "${YELLOW}是否删除路由持久化配置？${NC}"; then
+        # 删除 /etc/network/interfaces 中的 post-up
         if [ -f /etc/network/interfaces ] && [ -n "$CIDR" ]; then
             sed -i "/post-up ip -6 route add local $CIDR/d" /etc/network/interfaces
-            echo "持久化配置已删除。"
-        else
-            echo "未找到持久化配置或 CIDR 为空，跳过。"
+            echo "已从 /etc/network/interfaces 删除持久化配置。"
+        fi
+        # 删除 if-up.d 脚本
+        if [ -f /etc/network/if-up.d/outway-route ]; then
+            rm -f /etc/network/if-up.d/outway-route
+            echo "已删除 /etc/network/if-up.d/outway-route。"
         fi
     fi
 
