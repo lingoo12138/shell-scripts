@@ -1,5 +1,5 @@
 #!/bin/bash
-# outway-manager.sh - 交互式管理 Outway，支持配置保存与查看
+# outway-manager.sh - 交互式管理 Outway，支持随机端口
 # 用法：sudo ./outway-manager.sh
 
 set -e
@@ -58,6 +58,11 @@ confirm_step() {
 
 generate_password() {
     openssl rand -base64 12 2>/dev/null | tr -d '\n' || tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12
+}
+
+generate_random_port() {
+    # 生成 10000-65535 之间的随机端口
+    echo $(( (RANDOM % 55536) + 10000 ))
 }
 
 # ==================== 网卡检测 ====================
@@ -125,6 +130,31 @@ set_credentials() {
         PASSWORD="$default_pass"
         echo -e "${GREEN}使用随机密码: $PASSWORD${NC}"
     fi
+}
+
+# ==================== 设置端口 ====================
+set_port() {
+    echo -e "${BLUE}请选择端口设置：${NC}"
+    echo "  1) 使用默认端口 1080"
+    echo "  2) 手动输入端口"
+    echo "  3) 随机生成端口 (范围 10000-65535)"
+    read -p "请选择 [1-3]: " port_choice
+    case $port_choice in
+        1) PORT="1080" ;;
+        2)
+            read -p "请输入端口号: " PORT
+            if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+                echo -e "${RED}端口无效，使用默认 1080${NC}"
+                PORT="1080"
+            fi
+            ;;
+        3)
+            PORT=$(generate_random_port)
+            echo -e "${GREEN}随机生成端口: $PORT${NC}"
+            ;;
+        *) echo -e "${RED}无效选择，使用默认 1080${NC}"; PORT="1080" ;;
+    esac
+    echo -e "${GREEN}最终端口: $PORT${NC}"
 }
 
 # ==================== 配置 sysctl ====================
@@ -327,7 +357,6 @@ uninstall_outway() {
     echo -e "${RED}=== Outway 卸载（彻底清理） ===${NC}"
     if ! load_config; then
         echo -e "${YELLOW}未找到配置文件，将跳过部分清理（但会尝试删除服务、二进制等）。${NC}"
-        # 手动询问 CIDR 用于删除路由
         read -p "请输入之前使用的 CIDR（如不清楚可留空，跳过路由删除）: " CIDR
     fi
 
@@ -393,6 +422,7 @@ interactive_install() {
     detect_interfaces
     derive_cidr
     set_credentials
+    set_port
     configure_sysctl
     configure_route
     install_outway
